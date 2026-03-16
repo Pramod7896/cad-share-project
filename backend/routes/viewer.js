@@ -1,0 +1,261 @@
+﻿// routes/viewer.js
+// Handles:
+//   GET  /api/viewer/:token/info     - returns metadata + increments view counter
+//   GET  /api/viewer/:token/file     - streams the original CAD file (inline by default)
+//   GET  /api/viewer/:token/preview  - streams a preview version (e.g. DWG -> DXF)
+//   POST /api/viewer/:token/release  - releases single-viewer lock
+
+const express = require('express');
+const path = require('path');
+const fs = require('fs');
+const { spawn } = require('child_process');
+
+const { stmts } = require('../db/database');
+const { singleViewerGuard, releaseLock } = require('../middleware/sessionLock');
+
+const router = express.Router();
+
+// Prevent accidental double-counts (e.g. React 18 StrictMode effect re-runs in dev,
+// quick refreshes, or retries) from consuming multiple views for the same client.
+// Keyed by token + sessionId/ip and expires quickly.
+const viewDedupe = new Map(); // key -> timeout handle
+const VIEW_DEDUPE_TTL_MS = 10_000;
+const tokenDedupe = new Map(); // token -> timeout handle
+const TOKEN_DEDUPE_TTL_MS = 2_000;
+
+function markViewedOnce(dedupeKey) {
+  if (viewDedupe.has(dedupeKey)) return false;
+  const handle = setTimeout(() => viewDedupe.delete(dedupeKey), VIEW_DEDUPE_TTL_MS);
+  viewDedupe.set(dedupeKey, handle);
+  return true;
+}
+
+function markTokenViewedOnce(token) {
+  if (tokenDedupe.has(token)) return false;
+  const handle = setTimeout(() => tokenDedupe.delete(token), TOKEN_DEDUPE_TTL_MS);
+  tokenDedupe.set(token, handle);
+  return true;
+}
+
+function resolveCadFilePath(row) {
+  // Support both absolute paths (older DB rows) and relative paths:
+  // - "uploads/<stored_name>" (recommended)
+  // - "<stored_name>" (filename only)
+  const filePath = row.file_path;
+
+  const uploadsDir = path.resolve(__dirname, '..', 'uploads');
+  const backendRoot = path.resolve(__dirname, '..');
+
+  const normalized = String(filePath || '').replace(/^[\\/]+/, '');
+  const isUploadsRelative = /^uploads[\\/]/i.test(normalized);
+
+  const resolved = path.isAbsolute(normalized)
+    ? path.resolve(normalized)
+    : isUploadsRelative
+      ? path.resolve(backendRoot, normalized)
+      : path.resolve(uploadsDir, normalized);
+
+  const relativeToUploads = path.relative(uploadsDir, resolved);
+  const isInsideUploads =
+    relativeToUploads &&
+    !relativeToUploads.startsWith('..') &&
+    !path.isAbsolute(relativeToUploads);
+
+  return { uploadsDir, resolved, isInsideUploads };
+}
+
+function streamFile(res, filePath, fileName, mimeType, dispositionType = 'inline') {
+  const stat = fs.statSync(filePath);
+
+  res.setHeader('Content-Type', mimeType || 'application/octet-stream');
+  res.setHeader('Content-Length', stat.size);
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader(
+    'Content-Disposition',
+    `${dispositionType}; filename="${encodeURIComponent(fileName)}"`
+  );
+
+  const stream = fs.createReadStream(filePath);
+  stream.pipe(res);
+  stream.on('error', (err) => {
+    console.error('[viewer/stream] Stream error:', err);
+    res.status(500).end();
+  });
+}
+
+function safeDetails(message) {
+  // Avoid leaking server paths; keep details helpful but generic.
+  const s = String(message || '');
+  return s
+    .replace(/[A-Za-z]:\\\\[^\\s"]+/g, '<path>')
+    .replace(/\/[^\\s"]+/g, '<path>');
+}
+
+// GET /api/viewer/:token/info
+// Called by the frontend BEFORE showing the viewer.
+// Increments the view counter and returns file metadata.
+router.get('/:token/info', async (req, res) => {
+  const { token } = req.params;
+  const sessionId = req.headers['x-session-id'] || req.ip;
+
+  try {
+    const row = await stmts.getByToken(token);
+
+    if (!row) {
+      return res.status(404).json({ error: 'Link not found.' });
+    }
+
+    if (row.status === 'expired') {
+      return res.status(410).json({
+        error: 'This link has expired. Maximum view limit reached.',
+        expired: true,
+      });
+    }
+
+    // Single-viewer guard (optional - add single_viewer column to DB if needed)
+    const guard = singleViewerGuard(row.single_viewer === 1, token, sessionId);
+    if (!guard.allowed) {
+      return res.status(423).json({ error: guard.message, locked: true });
+    }
+
+    const dedupeKey = `${token}:${sessionId}`;
+
+    // Atomically increment + expire if needed, but guard against duplicate /info
+    // calls on initial render/refresh.
+    const shouldIncrement = markTokenViewedOnce(token) && markViewedOnce(dedupeKey);
+    const updated = shouldIncrement
+      ? await stmts.recordView(token, row.max_views)
+      : await stmts.getByToken(token);
+
+    return res.json({
+      file_name: updated.file_name,
+      file_size: updated.file_size,
+      mime_type: updated.mime_type,
+      current_views: updated.current_views,
+      max_views: updated.max_views,
+      status: updated.status,
+      created_at: updated.created_at,
+    });
+  } catch (err) {
+    console.error('[viewer/info] Error:', err);
+    return res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+// GET /api/viewer/:token/file
+// Streams the CAD file - no direct disk access from outside.
+router.get('/:token/file', async (req, res) => {
+  const { token } = req.params;
+
+  try {
+    const row = await stmts.getByToken(token);
+
+    if (!row) return res.status(404).send('Not found.');
+    if (row.status === 'expired') return res.status(410).send('Link expired.');
+
+    const { resolved, isInsideUploads } = resolveCadFilePath(row);
+    if (!isInsideUploads) return res.status(403).send('Forbidden.');
+
+    if (!fs.existsSync(resolved)) {
+      return res.status(404).send('File not found on server.');
+    }
+
+    const dispositionType = req.query.download === '1' ? 'attachment' : 'inline';
+    return streamFile(res, resolved, row.file_name, row.mime_type, dispositionType);
+  } catch (err) {
+    console.error('[viewer/file] Error:', err);
+    return res.status(500).send('Server error.');
+  }
+});
+
+// GET /api/viewer/:token/preview
+// For formats that need server-side conversion for preview (currently DWG -> DXF).
+router.get('/:token/preview', async (req, res) => {
+  const { token } = req.params;
+
+  try {
+    const row = await stmts.getByToken(token);
+
+    if (!row) return res.status(404).send('Not found.');
+    if (row.status === 'expired') return res.status(410).send('Link expired.');
+
+    const originalExt = path.extname(row.file_name || '').toLowerCase();
+
+    // Nothing to convert; serve original.
+    if (originalExt !== '.dwg') {
+      return res.redirect(302, `/api/viewer/${encodeURIComponent(token)}/file`);
+    }
+
+    const { uploadsDir, resolved: srcPath, isInsideUploads } = resolveCadFilePath(row);
+    if (!isInsideUploads) return res.status(403).send('Forbidden.');
+    if (!fs.existsSync(srcPath)) return res.status(404).send('File not found on server.');
+
+    const previewsDir = path.resolve(uploadsDir, 'previews');
+    fs.mkdirSync(previewsDir, { recursive: true });
+
+    const storedBase = path.basename(row.stored_name || 'file', path.extname(row.stored_name || ''));
+    const outPath = path.resolve(previewsDir, `${storedBase}.dxf`);
+
+    const srcStat = fs.statSync(srcPath);
+    const outExists = fs.existsSync(outPath);
+    const outFresh = outExists ? fs.statSync(outPath).mtimeMs >= srcStat.mtimeMs : false;
+
+    if (!outFresh) {
+      const template = String(process.env.DWG2DXF_CMD || '').trim();
+      if (!template) {
+        return res.status(501).json({
+          error: 'DWG preview is not configured on the server.',
+          hint: 'Set DWG2DXF_CMD to a command that converts {input} -> {output} (e.g. using ODA File Converter or LibreDWG dwg2dxf).',
+        });
+      }
+
+      const quotedIn = `"${srcPath.replace(/\"/g, '\\"')}"`;
+      const quotedOut = `"${outPath.replace(/\"/g, '\\"')}"`;
+      const cmd = template.replace(/\{input\}/g, quotedIn).replace(/\{output\}/g, quotedOut);
+
+      const backendRoot = path.resolve(__dirname, '..');
+      await new Promise((resolve, reject) => {
+        const child = spawn(cmd, { shell: true, windowsHide: true, cwd: backendRoot });
+        let stderr = '';
+        let stdout = '';
+        child.stderr.on('data', (d) => { stderr += String(d); });
+        child.stdout.on('data', (d) => { stdout += String(d); });
+        child.on('error', reject);
+        child.on('close', (code) => {
+          if (code === 0) return resolve();
+          const combined = [stderr, stdout].filter(Boolean).join('\n').slice(0, 4000);
+          reject(new Error(`DWG2DXF_CMD failed (exit ${code}): ${combined}`));
+        });
+      });
+
+      if (!fs.existsSync(outPath) || fs.statSync(outPath).size === 0) {
+        return res.status(500).json({ error: 'DWG preview conversion did not produce a DXF output.' });
+      }
+    }
+
+    return streamFile(
+      res,
+      outPath,
+      row.file_name.replace(/\.dwg$/i, '.dxf'),
+      'application/dxf',
+      'inline'
+    );
+  } catch (err) {
+    console.error('[viewer/preview] Error:', err);
+    const details = safeDetails(err?.message || err);
+    return res.status(500).json({
+      error: 'DWG->DXF conversion failed on the server.',
+      details,
+      hint: 'Verify ODA File Converter is installed and DWG2DXF_CMD/ODA_FILE_CONVERTER are set, then restart the backend.',
+    });
+  }
+});
+
+// POST /api/viewer/:token/release
+// Called when the viewer tab is closed (via navigator.sendBeacon)
+router.post('/:token/release', (req, res) => {
+  releaseLock(req.params.token);
+  res.status(204).end();
+});
+
+module.exports = router;

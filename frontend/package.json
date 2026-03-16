@@ -1,0 +1,26 @@
+{
+  "name": "cad-share-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-router-dom": "^6.22.3",
+    "three": "^0.162.0",
+    "occt-import-js": "^0.0.23",
+    "react-dropzone": "^14.2.3",
+    "axios": "^1.6.7",
+    "dxf-parser": "^1.1.2",
+    "react-scripts": "5.0.1"
+  },
+  "scripts": {
+    "postinstall": "node scripts/copy-occt-import.js",
+    "start": "react-scripts start",
+    "build": "react-scripts build"
+  },
+  "proxy": "http://localhost:5008",
+  "browserslist": {
+    "production": [">0.2%", "not dead", "not op_mini all"],
+    "development": ["last 1 chrome version", "last 1 firefox version", "last 1 safari version"]
+  }
+}
