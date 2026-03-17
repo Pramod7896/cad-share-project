@@ -3,6 +3,7 @@ import React, { useEffect, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import axios from 'axios';
 import CadViewer from '../components/CadViewer';
+import CadSheetViewer from '../components/CadSheetViewer';
 import { useSessionId } from '../hooks/useSessionId';
 
 const API = '/api/viewer';
@@ -14,17 +15,31 @@ export default function ViewerPage() {
   const [state, setState] = useState('loading'); // loading | ready | expired | locked | error
   const [meta, setMeta]   = useState(null);
   const [msg, setMsg]     = useState('');
+  const [copied, setCopied] = useState(false);
+
+  const shareUrl = token ? `${window.location.origin}/view/${token}` : '';
 
   const originalName = meta?.file_name;
   const isDwg = /\.dwg$/i.test(originalName || '');
+  const isDxf = /\.dxf$/i.test(originalName || '');
   const fileUrl = isDwg ? `${API}/${token}/preview` : `${API}/${token}/file`;
   const viewerFileName = isDwg ? originalName.replace(/\.dwg$/i, '.dxf') : originalName;
+
+  const renderSvgUrl = `${API}/${token}/render?format=svg`;
+  // Keep PNG optional. Many render pipelines (like dxf2svg) only support SVG.
+  // If you later add PNG rendering on the backend, set this to `.../render?format=png`.
+  const renderPngUrl = undefined;
 
   useEffect(() => {
     if (!token) return;
 
+    const uploadBypass = sessionStorage.getItem(`upload_bypass:${token}`);
+
     axios.get(`${API}/${token}/info`, {
-      headers: { 'x-session-id': sessionId },
+      headers: {
+        'x-session-id': sessionId,
+        ...(uploadBypass ? { 'x-upload-bypass': uploadBypass } : {}),
+      },
     })
     .then(({ data }) => {
       setMeta(data);
@@ -36,6 +51,9 @@ export default function ViewerPage() {
       else if (status === 410) { setState('expired'); setMsg(data?.error); }
       else if (status === 423) { setState('locked'); setMsg(data?.error); }
       else { setState('error'); setMsg('Something went wrong.'); }
+    })
+    .finally(() => {
+      if (uploadBypass) sessionStorage.removeItem(`upload_bypass:${token}`);
     });
 
     // Release single-viewer lock when tab closes
@@ -43,6 +61,13 @@ export default function ViewerPage() {
       navigator.sendBeacon(`${API}/${token}/release`);
     };
   }, [token, sessionId]);
+
+  const copyShareLink = () => {
+    if (!shareUrl) return;
+    navigator.clipboard.writeText(shareUrl);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2500);
+  };
 
   if (state === 'loading') return <StatusScreen icon="⏳" title="Loading…" />;
 
@@ -75,6 +100,15 @@ export default function ViewerPage() {
         <h2 style={styles.sidebarTitle}>CAD Viewer</h2>
         {meta && (
           <>
+            <div style={styles.metaGroup}>
+              <p style={styles.metaLabel}>Share</p>
+              <div style={styles.shareRow}>
+                <span style={styles.shareText}>{shareUrl}</span>
+                <button style={styles.shareBtn} onClick={copyShareLink}>
+                  {copied ? '✓ Copied' : 'Copy'}
+                </button>
+              </div>
+            </div>
             <div style={styles.metaGroup}>
               <p style={styles.metaLabel}>File</p>
               <p style={styles.metaValue}>{meta.file_name}</p>
@@ -109,12 +143,28 @@ export default function ViewerPage() {
 
       {/* 3D Viewer */}
       <main style={styles.viewer}>
-        <CadViewer
-          fileUrl={fileUrl}
-          fileName={viewerFileName}
-          displayName={originalName}
-          mimeType={meta?.mime_type}
-        />
+        {(isDwg || isDxf) ? (
+          <CadSheetViewer
+            svgUrl={renderSvgUrl}
+            pngUrl={renderPngUrl}
+            title={originalName}
+            fallback={(
+              <CadViewer
+                fileUrl={fileUrl}
+                fileName={viewerFileName}
+                displayName={originalName}
+                mimeType={meta?.mime_type}
+              />
+            )}
+          />
+        ) : (
+          <CadViewer
+            fileUrl={fileUrl}
+            fileName={viewerFileName}
+            displayName={originalName}
+            mimeType={meta?.mime_type}
+          />
+        )}
       </main>
     </div>
   );
@@ -170,6 +220,17 @@ const styles = {
   metaLabel: { color: '#555770', fontSize: 11, textTransform: 'uppercase',
                letterSpacing: '0.06em', margin: '0 0 4px' },
   metaValue: { color: '#c8cade', fontSize: 13, margin: 0, wordBreak: 'break-word' },
+  shareRow: {
+    display: 'flex', alignItems: 'center', gap: 8,
+    background: '#13151f', borderRadius: 8, padding: '8px 10px',
+    border: '1px solid #2a2d3e',
+  },
+  shareText: { color: '#c8cade', fontSize: 12, flex: 1, wordBreak: 'break-all', lineHeight: 1.35 },
+  shareBtn: {
+    padding: '5px 10px', borderRadius: 6, border: '1px solid #2a2d3e',
+    background: '#1e2142', color: '#9da8f8', fontSize: 12, cursor: 'pointer',
+    whiteSpace: 'nowrap',
+  },
   badge: {
     display: 'inline-block', padding: '3px 10px', borderRadius: 6,
     fontSize: 12, fontWeight: 500, border: '1px solid',

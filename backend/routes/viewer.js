@@ -12,6 +12,7 @@ const { spawn } = require('child_process');
 
 const { stmts } = require('../db/database');
 const { singleViewerGuard, releaseLock } = require('../middleware/sessionLock');
+const { consumeBypassIfValid } = require('../utils/uploadViewBypass');
 
 const router = express.Router();
 
@@ -91,12 +92,83 @@ function safeDetails(message) {
     .replace(/\/[^\\s"]+/g, '<path>');
 }
 
+function runTemplateCommand(template, vars, opts = {}) {
+  const quoted = (v) => `"${String(v).replace(/\"/g, '\\"')}"`;
+  const cmd = String(template || '')
+    .replace(/\{input\}/g, quoted(vars.input))
+    .replace(/\{output\}/g, quoted(vars.output))
+    .replace(/\{format\}/g, String(vars.format || ''))
+    .trim();
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, { shell: true, windowsHide: true, ...opts });
+    let stderr = '';
+    let stdout = '';
+    child.stderr.on('data', (d) => { stderr += String(d); });
+    child.stdout.on('data', (d) => { stdout += String(d); });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code === 0) return resolve({ stdout, stderr });
+      const combined = [stderr, stdout].filter(Boolean).join('\n').slice(0, 8000);
+      reject(new Error(`Command failed (exit ${code}): ${combined}`));
+    });
+  });
+}
+
+async function ensureDwgConvertedToDxf(row) {
+  const originalExt = path.extname(row.file_name || '').toLowerCase();
+  if (originalExt !== '.dwg') return null;
+
+  const { uploadsDir, resolved: srcPath, isInsideUploads } = resolveCadFilePath(row);
+  if (!isInsideUploads) {
+    const err = new Error('Forbidden.');
+    err.code = 'FORBIDDEN';
+    throw err;
+  }
+  if (!fs.existsSync(srcPath)) {
+    const err = new Error('File not found on server.');
+    err.code = 'NOT_FOUND';
+    throw err;
+  }
+
+  const previewsDir = path.resolve(uploadsDir, 'previews');
+  fs.mkdirSync(previewsDir, { recursive: true });
+
+  const storedBase = path.basename(row.stored_name || 'file', path.extname(row.stored_name || ''));
+  const outPath = path.resolve(previewsDir, `${storedBase}.dxf`);
+
+  const srcStat = fs.statSync(srcPath);
+  const outExists = fs.existsSync(outPath);
+  const outFresh = outExists ? fs.statSync(outPath).mtimeMs >= srcStat.mtimeMs : false;
+
+  if (!outFresh) {
+    const template = String(process.env.DWG2DXF_CMD || '').trim();
+    if (!template) {
+      const err = new Error('DWG preview is not configured on the server.');
+      err.code = 'DWG2DXF_NOT_CONFIGURED';
+      throw err;
+    }
+
+    const backendRoot = path.resolve(__dirname, '..');
+    await runTemplateCommand(template, { input: srcPath, output: outPath }, { cwd: backendRoot });
+
+    if (!fs.existsSync(outPath) || fs.statSync(outPath).size === 0) {
+      const err = new Error('DWG preview conversion did not produce a DXF output.');
+      err.code = 'DWG2DXF_NO_OUTPUT';
+      throw err;
+    }
+  }
+
+  return outPath;
+}
+
 // GET /api/viewer/:token/info
 // Called by the frontend BEFORE showing the viewer.
 // Increments the view counter and returns file metadata.
 router.get('/:token/info', async (req, res) => {
   const { token } = req.params;
   const sessionId = req.headers['x-session-id'] || req.ip;
+  const uploadBypass = req.headers['x-upload-bypass'];
 
   try {
     const row = await stmts.getByToken(token);
@@ -122,7 +194,8 @@ router.get('/:token/info', async (req, res) => {
 
     // Atomically increment + expire if needed, but guard against duplicate /info
     // calls on initial render/refresh.
-    const shouldIncrement = markTokenViewedOnce(token) && markViewedOnce(dedupeKey);
+    const skipCount = consumeBypassIfValid(token, req.ip, uploadBypass);
+    const shouldIncrement = !skipCount && markTokenViewedOnce(token) && markViewedOnce(dedupeKey);
     const updated = shouldIncrement
       ? await stmts.recordView(token, row.max_views)
       : await stmts.getByToken(token);
@@ -135,6 +208,7 @@ router.get('/:token/info', async (req, res) => {
       max_views: updated.max_views,
       status: updated.status,
       created_at: updated.created_at,
+      view_counted: shouldIncrement,
     });
   } catch (err) {
     console.error('[viewer/info] Error:', err);
@@ -186,67 +260,122 @@ router.get('/:token/preview', async (req, res) => {
       return res.redirect(302, `/api/viewer/${encodeURIComponent(token)}/file`);
     }
 
-    const { uploadsDir, resolved: srcPath, isInsideUploads } = resolveCadFilePath(row);
-    if (!isInsideUploads) return res.status(403).send('Forbidden.');
-    if (!fs.existsSync(srcPath)) return res.status(404).send('File not found on server.');
-
-    const previewsDir = path.resolve(uploadsDir, 'previews');
-    fs.mkdirSync(previewsDir, { recursive: true });
-
-    const storedBase = path.basename(row.stored_name || 'file', path.extname(row.stored_name || ''));
-    const outPath = path.resolve(previewsDir, `${storedBase}.dxf`);
-
-    const srcStat = fs.statSync(srcPath);
-    const outExists = fs.existsSync(outPath);
-    const outFresh = outExists ? fs.statSync(outPath).mtimeMs >= srcStat.mtimeMs : false;
-
-    if (!outFresh) {
-      const template = String(process.env.DWG2DXF_CMD || '').trim();
-      if (!template) {
-        return res.status(501).json({
-          error: 'DWG preview is not configured on the server.',
-          hint: 'Set DWG2DXF_CMD to a command that converts {input} -> {output} (e.g. using ODA File Converter or LibreDWG dwg2dxf).',
-        });
-      }
-
-      const quotedIn = `"${srcPath.replace(/\"/g, '\\"')}"`;
-      const quotedOut = `"${outPath.replace(/\"/g, '\\"')}"`;
-      const cmd = template.replace(/\{input\}/g, quotedIn).replace(/\{output\}/g, quotedOut);
-
-      const backendRoot = path.resolve(__dirname, '..');
-      await new Promise((resolve, reject) => {
-        const child = spawn(cmd, { shell: true, windowsHide: true, cwd: backendRoot });
-        let stderr = '';
-        let stdout = '';
-        child.stderr.on('data', (d) => { stderr += String(d); });
-        child.stdout.on('data', (d) => { stdout += String(d); });
-        child.on('error', reject);
-        child.on('close', (code) => {
-          if (code === 0) return resolve();
-          const combined = [stderr, stdout].filter(Boolean).join('\n').slice(0, 4000);
-          reject(new Error(`DWG2DXF_CMD failed (exit ${code}): ${combined}`));
-        });
-      });
-
-      if (!fs.existsSync(outPath) || fs.statSync(outPath).size === 0) {
-        return res.status(500).json({ error: 'DWG preview conversion did not produce a DXF output.' });
-      }
-    }
-
-    return streamFile(
-      res,
-      outPath,
-      row.file_name.replace(/\.dwg$/i, '.dxf'),
-      'application/dxf',
-      'inline'
-    );
+    const outPath = await ensureDwgConvertedToDxf(row);
+    return streamFile(res, outPath, row.file_name.replace(/\.dwg$/i, '.dxf'), 'application/dxf', 'inline');
   } catch (err) {
     console.error('[viewer/preview] Error:', err);
     const details = safeDetails(err?.message || err);
+    if (err?.code === 'DWG2DXF_NOT_CONFIGURED') {
+      return res.status(501).json({
+        error: 'DWG preview is not configured on the server.',
+        hint: 'Set DWG2DXF_CMD to a command that converts {input} -> {output} (e.g. using ODA File Converter or LibreDWG dwg2dxf).',
+      });
+    }
     return res.status(500).json({
       error: 'DWG->DXF conversion failed on the server.',
       details,
       hint: 'Verify ODA File Converter is installed and DWG2DXF_CMD/ODA_FILE_CONVERTER are set, then restart the backend.',
+    });
+  }
+});
+
+// GET /api/viewer/:token/render?format=svg|png
+// Renders a 2D sheet preview server-side for pixel-perfect viewing.
+router.get('/:token/render', async (req, res) => {
+  const { token } = req.params;
+  const format = String(req.query.format || 'svg').toLowerCase();
+  const force = String(req.query.force || '').toLowerCase();
+  const forceRender = force === '1' || force === 'true' || force === 'yes';
+
+  if (!['svg', 'png'].includes(format)) {
+    return res.status(400).json({ error: 'format must be svg or png.' });
+  }
+
+  try {
+    const row = await stmts.getByToken(token);
+    if (!row) return res.status(404).send('Not found.');
+    if (row.status === 'expired') return res.status(410).send('Link expired.');
+
+    const originalExt = path.extname(row.file_name || '').toLowerCase();
+    const backendRoot = path.resolve(__dirname, '..');
+
+    let inputPath;
+    let inputStat;
+    if (originalExt === '.dwg') {
+      inputPath = await ensureDwgConvertedToDxf(row);
+      inputStat = fs.statSync(inputPath);
+    } else if (originalExt === '.dxf') {
+      const { resolved, isInsideUploads } = resolveCadFilePath(row);
+      if (!isInsideUploads) return res.status(403).send('Forbidden.');
+      if (!fs.existsSync(resolved)) return res.status(404).send('File not found on server.');
+      inputPath = resolved;
+      inputStat = fs.statSync(inputPath);
+    } else {
+      return res.redirect(302, `/api/viewer/${encodeURIComponent(token)}/file`);
+    }
+
+    const { uploadsDir } = resolveCadFilePath(row);
+    const renderDir = path.resolve(uploadsDir, 'previews', 'render');
+    fs.mkdirSync(renderDir, { recursive: true });
+
+    const storedBase = path.basename(row.stored_name || 'file', path.extname(row.stored_name || ''));
+    const outPath = path.resolve(renderDir, `${storedBase}.${format}`);
+
+    const outExists = fs.existsSync(outPath);
+
+    // Consider renderer changes when deciding whether cached output is fresh.
+    let freshnessMtimeMs = inputStat.mtimeMs;
+    const templateForFreshness = String(process.env.CAD_RENDER_CMD || '').trim();
+    const backendRootForFreshness = path.resolve(__dirname, '..');
+    const deps = [];
+    if (/render-cad\.ps1/i.test(templateForFreshness)) {
+      deps.push(path.resolve(backendRootForFreshness, 'tools', 'render-cad.ps1'));
+      deps.push(path.resolve(backendRootForFreshness, 'scripts', 'dxf-render-svg.js'));
+    }
+    if (/dxf-render-svg\.js/i.test(templateForFreshness)) {
+      deps.push(path.resolve(backendRootForFreshness, 'scripts', 'dxf-render-svg.js'));
+    }
+    for (const dep of deps) {
+      try {
+        if (fs.existsSync(dep)) freshnessMtimeMs = Math.max(freshnessMtimeMs, fs.statSync(dep).mtimeMs);
+      } catch {
+        // ignore
+      }
+    }
+
+    const outFresh = !forceRender && outExists ? fs.statSync(outPath).mtimeMs >= freshnessMtimeMs : false;
+
+    if (!outFresh) {
+      const template = String(process.env.CAD_RENDER_CMD || '').trim();
+      if (!template) {
+        return res.status(501).json({
+          error: 'Server-side CAD rendering is not configured.',
+          hint: 'Set CAD_RENDER_CMD to a command that renders {input} -> {output} (SVG/PNG).',
+        });
+      }
+
+      await runTemplateCommand(template, { input: inputPath, output: outPath, format }, { cwd: backendRoot });
+
+      if (!fs.existsSync(outPath) || fs.statSync(outPath).size === 0) {
+        return res.status(500).json({ error: 'Render command did not produce an output file.' });
+      }
+    }
+
+    const mime = format === 'svg' ? 'image/svg+xml' : 'image/png';
+    return streamFile(res, outPath, `${path.basename(row.file_name, originalExt)}.${format}`, mime, 'inline');
+  } catch (err) {
+    console.error('[viewer/render] Error:', err);
+    const details = safeDetails(err?.message || err);
+    if (err?.code === 'DWG2DXF_NOT_CONFIGURED') {
+      return res.status(501).json({
+        error: 'DWG preview is not configured on the server.',
+        hint: 'Set DWG2DXF_CMD to a command that converts {input} -> {output} (e.g. using ODA File Converter or LibreDWG dwg2dxf).',
+      });
+    }
+    return res.status(500).json({
+      error: 'Server-side rendering failed.',
+      details,
+      hint: 'Verify CAD_RENDER_CMD is installed/working on the server and produces the requested format.',
     });
   }
 });

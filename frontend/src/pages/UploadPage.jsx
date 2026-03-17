@@ -1,6 +1,7 @@
 // pages/UploadPage.jsx
 import React, { useState, useCallback } from 'react';
 import { useDropzone } from 'react-dropzone';
+import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 
 const ACCEPTED_EXTENSIONS = ['.dwg','.dxf','.step','.stp','.iges','.igs','.obj','.stl'];
@@ -14,20 +15,18 @@ const VIEW_PRESETS = [
 ];
 
 export default function UploadPage() {
+  const navigate = useNavigate();
   const [file, setFile]         = useState(null);
   const [maxViews, setMaxViews] = useState(5);
   const [customMax, setCustomMax] = useState('');
   const [viewPreset, setViewPreset] = useState(5);
   const [uploading, setUploading]   = useState(false);
-  const [result, setResult]         = useState(null);
   const [error, setError]           = useState('');
-  const [copied, setCopied]         = useState(false);
 
   const onDrop = useCallback((accepted) => {
     if (accepted.length) {
       setFile(accepted[0]);
       setError('');
-      setResult(null);
     }
   }, []);
 
@@ -58,19 +57,16 @@ export default function UploadPage() {
       const { data } = await axios.post('/api/upload', formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
       });
-      setResult(data);
+      if (data?.token && data?.upload_bypass) {
+        sessionStorage.setItem(`upload_bypass:${data.token}`, String(data.upload_bypass));
+      }
       setFile(null);
+      if (data?.token) navigate(`/view/${data.token}`);
     } catch (err) {
       setError(err.response?.data?.error || 'Upload failed. Please try again.');
     } finally {
       setUploading(false);
     }
-  };
-
-  const copyLink = () => {
-    navigator.clipboard.writeText(result.share_url);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2500);
   };
 
   return (
@@ -132,21 +128,7 @@ export default function UploadPage() {
           {uploading ? 'Uploading…' : 'Upload & Generate Link'}
         </button>
 
-        {/* Success result */}
-        {result && (
-          <div style={styles.resultBox}>
-            <p style={styles.resultTitle}>✓ Link ready</p>
-            <div style={styles.linkRow}>
-              <span style={styles.linkText}>{result.share_url}</span>
-              <button style={styles.copyBtn} onClick={copyLink}>
-                {copied ? '✓ Copied' : 'Copy'}
-              </button>
-            </div>
-            <p style={styles.resultMeta}>
-              {result.file_name} · max {result.max_views} view{result.max_views !== 1 ? 's' : ''}
-            </p>
-          </div>
-        )}
+
       </div>
     </div>
   );
@@ -224,23 +206,4 @@ const styles = {
     transition: 'background 0.2s',
   },
   uploadBtnDisabled: { background: '#2a2d3e', color: '#555770', cursor: 'not-allowed' },
-
-  resultBox: {
-    marginTop: '1.5rem', padding: '1rem 1.25rem',
-    background: '#0e1f18', border: '1px solid #1a4a35',
-    borderRadius: 10,
-  },
-  resultTitle: { color: '#4ade80', fontSize: 13, fontWeight: 600, margin: '0 0 10px' },
-  linkRow: {
-    display: 'flex', alignItems: 'center', gap: 8,
-    background: '#0a1510', borderRadius: 8, padding: '8px 12px',
-    border: '1px solid #1a4a35',
-  },
-  linkText: { color: '#7dd3a8', fontSize: 13, flex: 1, wordBreak: 'break-all' },
-  copyBtn: {
-    padding: '5px 12px', borderRadius: 6, border: '1px solid #1a4a35',
-    background: '#1a4a35', color: '#4ade80', fontSize: 12, cursor: 'pointer',
-    whiteSpace: 'nowrap',
-  },
-  resultMeta: { color: '#557a66', fontSize: 12, margin: '8px 0 0' },
 };

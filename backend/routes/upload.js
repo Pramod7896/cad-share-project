@@ -7,6 +7,7 @@ const { v4: uuidv4 } = require('uuid');
 const { customAlphabet }  = require('nanoid');
 const { stmts }           = require('../db/database');
 const { validateCadFile } = require('../middleware/fileValidator');
+const { createBypass } = require('../utils/uploadViewBypass');
 
 const router = express.Router();
 
@@ -45,6 +46,7 @@ router.post('/', upload.single('file'), validateCadFile, async (req, res) => {
     }
 
     const shareToken = nanoid();
+    const uploadBypass = createBypass(shareToken);
 
     await stmts.insertFile({
       file_name:   file.originalname,
@@ -66,6 +68,7 @@ router.post('/', upload.single('file'), validateCadFile, async (req, res) => {
       success:    true,
       share_url:  shareUrl,
       token:      shareToken,
+      upload_bypass: uploadBypass,
       file_name:  file.originalname,
       file_size:  file.size,
       max_views:  maxViews,

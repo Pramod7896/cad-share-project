@@ -277,6 +277,16 @@ If DWG conversion is not configured (or fails), the viewer will display the back
   - `DWG2DXF_CMD=powershell -NoProfile -ExecutionPolicy Bypass -File tools\\dwg2dxf.ps1 -In {input} -Out {output}`
 - Optional: if ODA is not in the default install path, set `ODA_FILE_CONVERTER` (full path to `ODAFileConverter.exe`) in `backend/.env` or your environment.
 
+### 100% accurate 2D preview (server-side render)
+
+For sheet/layout-like drawings, browser DXF rendering is always best-effort. For a pixel-perfect preview, configure server-side rendering to **SVG or PNG**:
+
+- Backend endpoint: `GET /api/viewer/:token/render?format=svg|png`
+- Configure `CAD_RENDER_CMD` in `backend/.env` to a command template that renders `{input}` to `{output}`.
+  - Placeholders: `{input}`, `{output}`, `{format}`
+  - Example:
+    - `CAD_RENDER_CMD=powershell -NoProfile -ExecutionPolicy Bypass -File tools\\render-cad.ps1 -In {input} -Out {output} -Format {format}`
+
 ### Viewer controls
 
 All powered by `OrbitControls`:
